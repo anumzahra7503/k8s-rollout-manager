@@ -1,0 +1,9 @@
+version: 1
+
+env:
+  - GO111MODULE=on
+
+builds:
+  - id: default
+    main: .
+    binary: k8s-rollouts-manager

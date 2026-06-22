@@ -1,0 +1,771 @@
+package rollouts
+
+import (
+	"context"
+	"fmt"
+	"os"
+	"reflect"
+
+	rolloutsmanagerv1alpha1 "github.com/argoproj-labs/argo-rollouts-manager/api/v1alpha1"
+	"github.com/distribution/reference"
+	appsv1 "k8s.io/api/apps/v1"
+	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/api/resource"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/util/intstr"
+	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
+)
+
+func generateDesiredRolloutsDeployment(cr rolloutsmanagerv1alpha1.RolloutManager, sa corev1.ServiceAccount) (appsv1.Deployment, error) {
+
+	// NOTE: When updating this function, ensure that normalizeDeployment is updated as well. See that function for details.
+
+	// Configuration for the desired deployment
+	desiredDeployment := appsv1.Deployment{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      DefaultArgoRolloutsResourceName,
+			Namespace: cr.Namespace,
+		},
+	}
+	setRolloutsLabelsAndAnnotationsToObject(&desiredDeployment.ObjectMeta, cr)
+
+	// Add labels and annotations as well to the pod template
+	labels := map[string]string{
+		DefaultRolloutsSelectorKey: DefaultArgoRolloutsResourceName,
+	}
+	annotations := map[string]string{}
+	if cr.Spec.AdditionalMetadata != nil {
+		for k, v := range cr.Spec.AdditionalMetadata.Labels {
+			labels[k] = v
+		}
+		for k, v := range cr.Spec.AdditionalMetadata.Annotations {
+			annotations[k] = v
+		}
+	}
+
+	// Default number of replicas is 1, update it to 2 if HA is enabled
+	var replicas int32 = 1
+	if cr.Spec.HA != nil && cr.Spec.HA.Enabled {
+		replicas = 2
+	}
+
+	desiredDeployment.Spec = appsv1.DeploymentSpec{
+		Replicas: &replicas,
+		Selector: &metav1.LabelSelector{
+			MatchLabels: labels,
+		},
+		Template: corev1.PodTemplateSpec{
+			ObjectMeta: metav1.ObjectMeta{
+				Labels:      labels,
+				Annotations: annotations,
+			},
+			Spec: corev1.PodSpec{
+				NodeSelector: map[string]string{
+					"kubernetes.io/os": "linux",
+				},
+			},
+		},
+		Strategy: appsv1.DeploymentStrategy{
+			Type: appsv1.RollingUpdateDeploymentStrategyType,
+		},
+	}
+
+	if cr.Spec.HA != nil && cr.Spec.HA.Enabled {
+		desiredDeployment.Spec.Template.Spec.Affinity = &corev1.Affinity{
+			PodAntiAffinity: &corev1.PodAntiAffinity{
+				PreferredDuringSchedulingIgnoredDuringExecution: []corev1.WeightedPodAffinityTerm{
+					{
+						PodAffinityTerm: corev1.PodAffinityTerm{
+							LabelSelector: &metav1.LabelSelector{
+								MatchLabels: labels,
+							},
+							TopologyKey: TopologyKubernetesZoneLabel,
+						},
+						Weight: int32(100),
+					},
+				},
+				RequiredDuringSchedulingIgnoredDuringExecution: []corev1.PodAffinityTerm{
+					{
+						LabelSelector: &metav1.LabelSelector{
+							MatchLabels: labels,
+						},
+						TopologyKey: KubernetesHostnameLabel,
+					},
+				},
+			},
+		}
+	}
+
+	if cr.Spec.NodePlacement != nil {
+		desiredDeployment.Spec.Template.Spec.NodeSelector = appendStringMap(
+			desiredDeployment.Spec.Template.Spec.NodeSelector, cr.Spec.NodePlacement.NodeSelector)
+		desiredDeployment.Spec.Template.Spec.Tolerations = cr.Spec.NodePlacement.Tolerations
+	}
+
+	desiredPodSpec := &desiredDeployment.Spec.Template.Spec
+
+	runAsNonRoot := true
+	desiredPodSpec.SecurityContext = &corev1.PodSecurityContext{
+		RunAsNonRoot: &runAsNonRoot,
+	}
+
+	desiredPodSpec.ServiceAccountName = sa.ObjectMeta.Name
+
+	rolloutsCont, err := rolloutsContainer(cr)
+	if err != nil {
+		return appsv1.Deployment{}, err
+	}
+	desiredPodSpec.Containers = []corev1.Container{
+		rolloutsCont,
+	}
+
+	desiredPodSpec.Volumes = []corev1.Volume{
+		{
+			Name: "plugin-bin",
+			VolumeSource: corev1.VolumeSource{
+				EmptyDir: &corev1.EmptyDirVolumeSource{},
+			},
+		},
+		{
+			Name: "tmp",
+			VolumeSource: corev1.VolumeSource{
+				EmptyDir: &corev1.EmptyDirVolumeSource{},
+			},
+		},
+	}
+
+	return desiredDeployment, nil
+}
+
+// Reconcile the Rollouts controller deployment.
+func (r *RolloutManagerReconciler) reconcileRolloutsDeployment(ctx context.Context, cr rolloutsmanagerv1alpha1.RolloutManager, sa corev1.ServiceAccount) error {
+
+	desiredDeployment, err := generateDesiredRolloutsDeployment(cr, sa)
+	if err != nil {
+		return err
+	}
+
+	normalizedDesiredDeployment, err := normalizeDeployment(desiredDeployment, cr)
+	if err != nil {
+		// If you see this warning in the logs, verify that normalizedDeployment is fully consistent with generateDesiredRolloutsDeployment. See normalizeDeployment for details.
+		log.Error(fmt.Errorf("unexpected fail on normalizing generated rollouts Deployment"), "", "err", err)
+		// We intentionally continue without returning, as the error is non-fatal at runtime
+	}
+
+	if !reflect.DeepEqual(normalizedDesiredDeployment, desiredDeployment) { // sanity test to verify that generateDesiredRolloutsDeployments and normalizeDeployment are consistent.
+		// If you see this warning in the logs, verify that normalizedDeployment is fully consistent with generateDesiredRolloutsDeployment. See normalizeDeployment for details.
+		deploymentsDifferent := identifyDeploymentDifference(normalizedDesiredDeployment, desiredDeployment)
+		log.Error(fmt.Errorf("normalized form of desired Deployment was not equal: %v", deploymentsDifferent), "")
+		// We intentionally continue without returning, as the error is non-fatal at runtime
+	}
+
+	// If the deployment for rollouts does not exist, create one.
+	actualDeployment := &appsv1.Deployment{}
+
+	if err := fetchObject(ctx, r.Client, cr.Namespace, DefaultArgoRolloutsResourceName, actualDeployment); err != nil {
+		if !errors.IsNotFound(err) {
+			return fmt.Errorf("failed to get the Deployment %s: %w", DefaultArgoRolloutsResourceName, err)
+		}
+
+		return r.createNewRolloutsDeployment(ctx, cr, desiredDeployment)
+	}
+
+	normalizedActualDeployment, err := normalizeDeployment(*actualDeployment, cr)
+
+	if err != nil || !reflect.DeepEqual(normalizedActualDeployment, normalizedDesiredDeployment) {
+
+		deploymentsDifferent := identifyDeploymentDifference(normalizedActualDeployment, normalizedDesiredDeployment)
+
+		log.Info("updating Deployment due to detected difference: " + deploymentsDifferent)
+
+		if !reflect.DeepEqual(normalizedActualDeployment.Spec.Selector, normalizedDesiredDeployment.Spec.Selector) {
+			// delete and recreate the Deployment if the .spec.selector field changes: this field is immutable.
+
+			log.Info("deleting and recreating Deployment, as the .spec.selector field of the Deployment has changed. Since this field is immutable, the Deployment needs to be recreated.")
+
+			if err := r.Client.Delete(ctx, &desiredDeployment); err != nil {
+				return fmt.Errorf("unable to delete Rollouts Deployment after .spec.selector change: %w", err)
+			}
+
+			return r.createNewRolloutsDeployment(ctx, cr, desiredDeployment)
+		}
+
+		if deploymentsDifferent == "" {
+			log.Error(fmt.Errorf("warning: a difference was detected by DeepEqual, but not by identifyDeploymentDifference"), "")
+			// this error is a warning, only. Continue.
+		}
+
+		actualDeployment.Spec.Strategy = desiredDeployment.Spec.Strategy
+		actualDeployment.Spec.Template.Spec.Containers = desiredDeployment.Spec.Template.Spec.Containers
+		actualDeployment.Spec.Template.Spec.ServiceAccountName = desiredDeployment.Spec.Template.Spec.ServiceAccountName
+
+		actualDeployment.Spec.Replicas = desiredDeployment.Spec.Replicas
+		actualDeployment.Spec.Template.Spec.Affinity = desiredDeployment.Spec.Template.Spec.Affinity
+
+		actualDeployment.Labels = combineStringMaps(actualDeployment.Labels, desiredDeployment.Labels)
+		actualDeployment.Annotations = combineStringMaps(actualDeployment.Annotations, desiredDeployment.Annotations)
+
+		actualDeployment.Spec.Template.Labels = desiredDeployment.Spec.Template.Labels
+		actualDeployment.Spec.Template.Annotations = desiredDeployment.Spec.Template.Annotations
+		actualDeployment.Spec.Selector = desiredDeployment.Spec.Selector
+		actualDeployment.Spec.Template.Spec.NodeSelector = desiredDeployment.Spec.Template.Spec.NodeSelector
+		actualDeployment.Spec.Template.Spec.Tolerations = desiredDeployment.Spec.Template.Spec.Tolerations
+		actualDeployment.Spec.Template.Spec.SecurityContext = desiredDeployment.Spec.Template.Spec.SecurityContext
+		actualDeployment.Spec.Template.Spec.Volumes = desiredDeployment.Spec.Template.Spec.Volumes
+		return r.Client.Update(ctx, actualDeployment)
+	}
+	return nil
+}
+
+func (r *RolloutManagerReconciler) createNewRolloutsDeployment(ctx context.Context, cr rolloutsmanagerv1alpha1.RolloutManager, desiredDeployment appsv1.Deployment) error {
+	if err := controllerutil.SetControllerReference(&cr, &desiredDeployment, r.Scheme); err != nil {
+		return err
+	}
+	log.Info(fmt.Sprintf("Creating Deployment %s", DefaultArgoRolloutsResourceName))
+	return r.Client.Create(ctx, &desiredDeployment)
+}
+
+// identifyDeploymentDifference is a simple comparison of the contents of two deployments, returning "" if they are the same, otherwise returning the name of the field that changed.
+func identifyDeploymentDifference(x appsv1.Deployment, y appsv1.Deployment) string {
+
+	xPodSpec := x.Spec.Template.Spec
+	yPodSpec := y.Spec.Template.Spec
+
+	if !reflect.DeepEqual(xPodSpec.Containers, yPodSpec.Containers) {
+		return "Spec.Template.Spec.Containers"
+	}
+
+	if xPodSpec.ServiceAccountName != yPodSpec.ServiceAccountName {
+		return "ServiceAccountName"
+	}
+
+	if !reflect.DeepEqual(x.Spec.Strategy, y.Spec.Strategy) {
+		return ".Spec.Strategy"
+	}
+
+	if !reflect.DeepEqual(x.Labels, y.Labels) {
+		return "Labels"
+	}
+
+	if !reflect.DeepEqual(x.Annotations, y.Annotations) {
+		return "Annotations"
+	}
+
+	if !reflect.DeepEqual(x.Spec.Template.Labels, y.Spec.Template.Labels) {
+		return ".Spec.Template.Labels"
+	}
+
+	if !reflect.DeepEqual(x.Spec.Template.Annotations, y.Spec.Template.Annotations) {
+		return ".Spec.Template.Annotations"
+	}
+
+	if !reflect.DeepEqual(x.Spec.Selector, y.Spec.Selector) {
+		return ".Spec.Selector"
+	}
+
+	if !reflect.DeepEqual(x.Spec.Template.Spec.NodeSelector, y.Spec.Template.Spec.NodeSelector) {
+		return "Spec.Template.Spec.NodeSelector"
+	}
+
+	if !reflect.DeepEqual(x.Spec.Template.Spec.Tolerations, y.Spec.Template.Spec.Tolerations) {
+		return "Spec.Template.Spec.Tolerations"
+	}
+
+	if !reflect.DeepEqual(xPodSpec.SecurityContext, yPodSpec.SecurityContext) {
+		return "Spec.Template.Spec.SecurityContext"
+	}
+
+	if !reflect.DeepEqual(x.Spec.Template.Spec.Volumes, y.Spec.Template.Spec.Volumes) {
+		return "Spec.Template.Spec.Volumes"
+	}
+
+	if !reflect.DeepEqual(x.Spec.Replicas, y.Spec.Replicas) {
+		return "Spec.Replicas"
+	}
+
+	if !reflect.DeepEqual(x.Spec.Template.Spec.Affinity, y.Spec.Template.Spec.Affinity) {
+		return "Spec.Template.Spec.Affinity"
+	}
+
+	return ""
+}
+
+// defaultRolloutsContainerResources return the default resource constaints set on containers, when the RolloutManager CR does not have resource constraints set.
+func defaultRolloutsContainerResources() corev1.ResourceRequirements {
+	return corev1.ResourceRequirements{
+		Limits: corev1.ResourceList{
+			corev1.ResourceEphemeralStorage: resource.MustParse("1Gi"),
+		},
+	}
+}
+
+func rolloutsContainer(cr rolloutsmanagerv1alpha1.RolloutManager) (corev1.Container, error) {
+
+	// NOTE: When updating this function, ensure that normalizeDeployment is updated as well. See that function for details.
+
+	// Global proxy env vars go firstArgoRollouts
+	rolloutsEnv := cr.Spec.Env
+
+	// Environment specified in the CR take precedence over everything else
+	rolloutsEnv = envMerge(rolloutsEnv, proxyEnvVars(), false)
+
+	containerResources := cr.Spec.ControllerResources
+	if containerResources == nil {
+		defaultContainerResources := defaultRolloutsContainerResources()
+		containerResources = &defaultContainerResources
+	}
+
+	commandArgs, err := getRolloutsCommandArgs(cr)
+	if err != nil {
+		return corev1.Container{}, err
+	}
+
+	image, err := getRolloutsContainerImage(cr)
+	if err != nil {
+		return corev1.Container{}, err
+	}
+
+	imagePullPolicy, err := getImagePullPolicy(cr)
+	if err != nil {
+		return corev1.Container{}, err
+	}
+
+	return corev1.Container{
+		Args:            commandArgs,
+		Env:             rolloutsEnv,
+		Image:           image,
+		ImagePullPolicy: imagePullPolicy,
+		LivenessProbe: &corev1.Probe{
+			FailureThreshold: 3,
+			ProbeHandler: corev1.ProbeHandler{
+				HTTPGet: &corev1.HTTPGetAction{
+					Path: "/healthz",
+					Port: intstr.FromString("healthz"),
+				},
+			},
+			InitialDelaySeconds: int32(30),
+			PeriodSeconds:       int32(20),
+			SuccessThreshold:    int32(1),
+			TimeoutSeconds:      int32(10),
+		},
+		Name: "argo-rollouts",
+		Ports: []corev1.ContainerPort{
+			{
+				ContainerPort: 8080,
+				Name:          "healthz",
+			},
+			{
+				ContainerPort: 8090,
+				Name:          "metrics",
+			},
+		},
+		ReadinessProbe: &corev1.Probe{
+			FailureThreshold: int32(5),
+			ProbeHandler: corev1.ProbeHandler{
+				HTTPGet: &corev1.HTTPGetAction{
+					Path: "/metrics",
+					Port: intstr.FromString("metrics"),
+				},
+			},
+			InitialDelaySeconds: int32(10),
+			PeriodSeconds:       int32(5),
+			SuccessThreshold:    int32(1),
+			TimeoutSeconds:      int32(4),
+		},
+		SecurityContext: &corev1.SecurityContext{
+			Capabilities: &corev1.Capabilities{
+				Drop: []corev1.Capability{
+					"ALL",
+				},
+			},
+			AllowPrivilegeEscalation: boolPtr(false),
+			ReadOnlyRootFilesystem:   boolPtr(true),
+			RunAsNonRoot:             boolPtr(true),
+			SeccompProfile: &corev1.SeccompProfile{
+				Type: corev1.SeccompProfileTypeRuntimeDefault,
+			},
+		},
+		VolumeMounts: []corev1.VolumeMount{
+			{
+				MountPath: "/home/argo-rollouts/plugin-bin",
+				Name:      "plugin-bin",
+			},
+			{
+				MountPath: "/tmp",
+				Name:      "tmp",
+			},
+		},
+		Resources: *containerResources,
+	}, nil
+
+}
+
+// One of the goals of an operator is to reconcile the live state of a resource on the cluster, with a target state for that resource. However, one of the challenges in doing so is that some fields of the resource will naturally differ from the values that are generated: for example, some field have default values which are only set after creation. This can make it challenging to compare the live/target status. Various strategies exist to handle.
+//
+// The strategy used in this file is implemented here in normalizeDeployment: normalizeDeployment will created a normalized representation of any input Deployment: the normal form will only contains fields which are relevant/useful to the operator. All other fields will be discarded.
+//
+// You can then use...
+//
+//	reflect.DeepEqual( normalizeDeployment( /* desired deployment */), normalizeDeployment( /* actual deployment from k8s*/))
+//
+// ... to determine if the actual deployment from k8s needs to be updated.
+//
+// NOTE: When updating 'generateDesiredRolloutsDeployment', ensure this function is updated as well.
+// - Specifically, in generateDesiredRolloutsDeployment, if a new field of Deployment is modified, it should be added to the copy logic here.
+func normalizeDeployment(inputParam appsv1.Deployment, cr rolloutsmanagerv1alpha1.RolloutManager) (appsv1.Deployment, error) {
+
+	input := inputParam.DeepCopy()
+
+	res := appsv1.Deployment{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:        input.ObjectMeta.Name,
+			Namespace:   input.ObjectMeta.Namespace,
+			Labels:      input.ObjectMeta.Labels,
+			Annotations: input.ObjectMeta.Annotations,
+		},
+	}
+
+	// Remove labels/annotations from the Deployment that are not in the set of labels/annotations that the operator will add to resources.
+	standardLabelsAndAnnotations := input.ObjectMeta.DeepCopy()
+	setRolloutsLabelsAndAnnotationsToObject(standardLabelsAndAnnotations, cr)
+
+	for k := range res.Labels {
+		if _, exists := standardLabelsAndAnnotations.Labels[k]; !exists {
+			delete(res.Labels, k)
+		}
+	}
+	for k := range res.Annotations {
+		if _, exists := standardLabelsAndAnnotations.Annotations[k]; !exists {
+			delete(res.Annotations, k)
+		}
+	}
+
+	if input.Spec.Selector == nil {
+		return appsv1.Deployment{}, fmt.Errorf("missing .spec.selector")
+	}
+
+	inputSpecSecurityContext := input.Spec.Template.Spec.SecurityContext
+
+	if inputSpecSecurityContext == nil {
+		return appsv1.Deployment{}, fmt.Errorf("missing .spec.template.spec.securityContext")
+	}
+
+	inputSpecVolumes := input.Spec.Template.Spec.Volumes
+	if inputSpecVolumes == nil || len(inputSpecVolumes) != 2 {
+		return appsv1.Deployment{}, fmt.Errorf("missing .spec.template.spec.volumes")
+	}
+
+	// Default number of replicas is 1
+	var replicas int32 = 1
+	if input.Spec.Replicas != nil {
+		replicas = *input.Spec.Replicas
+	}
+
+	res.Spec = appsv1.DeploymentSpec{
+		Replicas: &replicas,
+		Selector: &metav1.LabelSelector{
+			MatchLabels: normalizeMap(input.Spec.Selector.MatchLabels),
+		},
+		Template: corev1.PodTemplateSpec{
+			ObjectMeta: metav1.ObjectMeta{
+				Labels:      normalizeMap(input.Spec.Template.Labels),
+				Annotations: normalizeMap(input.Spec.Template.Annotations),
+			},
+			Spec: corev1.PodSpec{
+				NodeSelector:       input.Spec.Template.Spec.NodeSelector,
+				Tolerations:        input.Spec.Template.Spec.Tolerations,
+				ServiceAccountName: input.Spec.Template.Spec.ServiceAccountName,
+				SecurityContext: &corev1.PodSecurityContext{
+					RunAsNonRoot: input.Spec.Template.Spec.SecurityContext.RunAsNonRoot,
+				},
+				Volumes: []corev1.Volume{inputSpecVolumes[0], inputSpecVolumes[1]},
+			},
+		},
+		Strategy: appsv1.DeploymentStrategy{
+			Type: input.Spec.Strategy.Type,
+			// we ignore the default values set in RollingUpdate:
+		},
+	}
+
+	if len(input.Spec.Template.Spec.Containers) != 1 {
+		return appsv1.Deployment{}, fmt.Errorf("incorrect number of .spec.template.spec.containers")
+	}
+
+	inputContainer := input.Spec.Template.Spec.Containers[0]
+	inputLivenessProbe := inputContainer.LivenessProbe
+	inputPorts := inputContainer.Ports
+	inputReadinessProbe := inputContainer.ReadinessProbe
+	inputSecurityContext := inputContainer.SecurityContext
+	inputVolumeMounts := inputContainer.VolumeMounts
+
+	if inputLivenessProbe == nil {
+		return appsv1.Deployment{}, fmt.Errorf("incorrect liveness probe")
+	}
+
+	if inputLivenessProbe.ProbeHandler.HTTPGet == nil {
+		return appsv1.Deployment{}, fmt.Errorf("incorrect http get in liveness probe")
+	}
+
+	if inputReadinessProbe == nil {
+		return appsv1.Deployment{}, fmt.Errorf("incorrect readiness probe")
+	}
+
+	if inputReadinessProbe.ProbeHandler.HTTPGet == nil {
+		return appsv1.Deployment{}, fmt.Errorf("incorrect http get in readiness probe")
+	}
+
+	if inputPorts == nil || len(inputPorts) != 2 {
+		return appsv1.Deployment{}, fmt.Errorf("incorrect input ports")
+	}
+
+	if inputSecurityContext == nil || inputSecurityContext.Capabilities == nil {
+		return appsv1.Deployment{}, fmt.Errorf("incorrect security context")
+	}
+
+	if inputVolumeMounts == nil || len(inputVolumeMounts) != 2 {
+		return appsv1.Deployment{}, fmt.Errorf("incorrect volume mounts")
+	}
+
+	// Nil string slices need to be converted to empty string slices, because  reflect.DeepEqual(nil, []string{}) is false, despite being functionally the same, here.
+	if len(inputContainer.Args) == 0 {
+		inputContainer.Args = make([]string, 0)
+	}
+
+	if len(inputContainer.Env) == 0 {
+		inputContainer.Env = make([]corev1.EnvVar, 0)
+	}
+
+	if input.Spec.Template.Spec.Affinity != nil {
+
+		res.Spec.Template.Spec.Affinity = &corev1.Affinity{}
+
+		// As of this writing, we don't touch pod affinity field at at all, so just copy it as is: any changes to this field should be reverted.
+		res.Spec.Template.Spec.Affinity.PodAffinity = input.Spec.Template.Spec.Affinity.PodAffinity
+
+		// We do touch anti affinity field, so check it then copy it into res
+		if input.Spec.Template.Spec.Affinity.PodAntiAffinity != nil {
+
+			if len(input.Spec.Template.Spec.Affinity.PodAntiAffinity.PreferredDuringSchedulingIgnoredDuringExecution) != 1 {
+				return appsv1.Deployment{}, fmt.Errorf("incorrect number of anti-affinity PreferredDuringSchedulingIgnoredDuringExecution")
+			}
+
+			if len(input.Spec.Template.Spec.Affinity.PodAntiAffinity.RequiredDuringSchedulingIgnoredDuringExecution) != 1 {
+				return appsv1.Deployment{}, fmt.Errorf("incorrect number of anti-affinity RequiredDuringSchedulingIgnoredDuringExecution")
+			}
+
+			res.Spec.Template.Spec.Affinity.PodAntiAffinity = &corev1.PodAntiAffinity{
+				PreferredDuringSchedulingIgnoredDuringExecution: []corev1.WeightedPodAffinityTerm{
+					{
+						PodAffinityTerm: corev1.PodAffinityTerm{
+							LabelSelector: &metav1.LabelSelector{
+								MatchLabels: normalizeMap(input.Spec.Selector.MatchLabels),
+							},
+							TopologyKey: input.Spec.Template.Spec.Affinity.PodAntiAffinity.PreferredDuringSchedulingIgnoredDuringExecution[0].PodAffinityTerm.TopologyKey,
+						},
+						Weight: input.Spec.Template.Spec.Affinity.PodAntiAffinity.PreferredDuringSchedulingIgnoredDuringExecution[0].Weight,
+					},
+				},
+				RequiredDuringSchedulingIgnoredDuringExecution: []corev1.PodAffinityTerm{
+					{
+						LabelSelector: &metav1.LabelSelector{
+							MatchLabels: normalizeMap(input.Spec.Selector.MatchLabels),
+						},
+						TopologyKey: input.Spec.Template.Spec.Affinity.PodAntiAffinity.RequiredDuringSchedulingIgnoredDuringExecution[0].TopologyKey,
+					},
+				},
+			}
+		}
+	}
+
+	res.Spec.Template.Spec.Containers = []corev1.Container{{
+		Args:            inputContainer.Args,
+		Env:             inputContainer.Env,
+		Image:           inputContainer.Image,
+		ImagePullPolicy: inputContainer.ImagePullPolicy,
+		LivenessProbe: &corev1.Probe{
+			FailureThreshold: inputLivenessProbe.FailureThreshold,
+			ProbeHandler: corev1.ProbeHandler{
+				HTTPGet: &corev1.HTTPGetAction{
+					Path: inputLivenessProbe.ProbeHandler.HTTPGet.Path,
+					Port: inputLivenessProbe.ProbeHandler.HTTPGet.Port,
+				},
+			},
+			InitialDelaySeconds: inputLivenessProbe.InitialDelaySeconds,
+			PeriodSeconds:       inputLivenessProbe.PeriodSeconds,
+			SuccessThreshold:    inputLivenessProbe.SuccessThreshold,
+			TimeoutSeconds:      inputLivenessProbe.TimeoutSeconds,
+		},
+		Name: inputContainer.Name,
+		Ports: []corev1.ContainerPort{
+			{
+				ContainerPort: inputPorts[0].ContainerPort,
+				Name:          inputPorts[0].Name,
+			},
+			{
+				ContainerPort: inputPorts[1].ContainerPort,
+				Name:          inputPorts[1].Name,
+			},
+		},
+		ReadinessProbe: &corev1.Probe{
+			FailureThreshold: inputReadinessProbe.FailureThreshold,
+			ProbeHandler: corev1.ProbeHandler{
+				HTTPGet: &corev1.HTTPGetAction{
+					Path: inputReadinessProbe.ProbeHandler.HTTPGet.Path,
+					Port: inputReadinessProbe.ProbeHandler.HTTPGet.Port,
+				},
+			},
+			InitialDelaySeconds: inputReadinessProbe.InitialDelaySeconds,
+			PeriodSeconds:       inputReadinessProbe.PeriodSeconds,
+			SuccessThreshold:    inputReadinessProbe.SuccessThreshold,
+			TimeoutSeconds:      inputReadinessProbe.TimeoutSeconds,
+		},
+		Resources: inputContainer.Resources,
+		SecurityContext: &corev1.SecurityContext{
+			Capabilities: &corev1.Capabilities{
+				Drop: inputSecurityContext.Capabilities.Drop,
+			},
+			AllowPrivilegeEscalation: inputSecurityContext.AllowPrivilegeEscalation,
+			ReadOnlyRootFilesystem:   inputSecurityContext.ReadOnlyRootFilesystem,
+			RunAsNonRoot:             inputSecurityContext.RunAsNonRoot,
+			SeccompProfile:           inputSecurityContext.SeccompProfile,
+		},
+		VolumeMounts: []corev1.VolumeMount{
+			{
+				Name:      inputVolumeMounts[0].Name,
+				MountPath: inputVolumeMounts[0].MountPath,
+			},
+			{
+				Name:      inputVolumeMounts[1].Name,
+				MountPath: inputVolumeMounts[1].MountPath,
+			},
+		},
+	}}
+
+	return res, nil
+
+}
+
+// Confirm nil maps to empty map, to allow them to be compared by reflect.DeepEqual()
+func normalizeMap(in map[string]string) map[string]string {
+	if len(in) == 0 {
+		return make(map[string]string, 0)
+	}
+	return in
+}
+
+// boolPtr returns a pointer to val
+func boolPtr(val bool) *bool {
+	return &val
+}
+
+// Returns the container image for rollouts controller.
+func getRolloutsContainerImage(cr rolloutsmanagerv1alpha1.RolloutManager) (string, error) {
+
+	// Order of priority:
+	// 1) cr.spec.image/tag
+	// 2) env
+	// 3) default images
+
+	image := cr.Spec.Image
+	tag := cr.Spec.Version
+
+	// Check if environment variable is set
+	envVal := os.Getenv(ArgoRolloutsImageEnvName)
+
+	if envVal != "" {
+
+		// If no spec values are provided and env var is set, use env var as-is
+		if image == "" && tag == "" {
+			return envVal, nil
+		}
+
+		// If no cr.Spec.Image, use value from env
+		if image == "" {
+			// Parse environment variable image if it exists and extract the base image name
+			baseImageName, err := extractBaseImageName(envVal)
+			if err != nil {
+				log.Error(err, "Failed to parse environment variable image", "envVal", envVal)
+				return "", err
+			}
+			image = baseImageName
+		}
+
+	}
+
+	if image == "" {
+		image = DefaultArgoRolloutsImage
+	}
+	if tag == "" {
+		tag = DefaultArgoRolloutsVersion
+	}
+
+	return combineImageTag(image, tag), nil
+}
+
+// extractBaseImageName extracts the base image name from a full image reference (removing tag/digest)
+func extractBaseImageName(imageRef string) (string, error) {
+	ref, err := reference.Parse(imageRef)
+	if err != nil {
+		return "", err
+	}
+	var name string
+	if named, ok := ref.(reference.Named); ok {
+		name = named.Name()
+	} else {
+		return "", fmt.Errorf("unable to extract base image name: %s", imageRef)
+	}
+	return name, nil
+}
+
+// getImagePullPolicy returns the image pull policy for the rollouts container.
+// Order of priority:
+// 1) cr.spec.imagePullPolicy
+// 2) IMAGE_PULL_POLICY environment variable
+// 3) default: corev1.PullIfNotPresent
+func getImagePullPolicy(cr rolloutsmanagerv1alpha1.RolloutManager) (corev1.PullPolicy, error) {
+	// First priority: use value from CR spec
+	if cr.Spec.ImagePullPolicy != "" {
+		return cr.Spec.ImagePullPolicy, nil
+	}
+
+	// Second priority: check environment variable
+	envVal := os.Getenv(ImagePullPolicy)
+	if envVal != "" {
+		switch envVal {
+		case string(corev1.PullAlways):
+			return corev1.PullAlways, nil
+		case string(corev1.PullIfNotPresent):
+			return corev1.PullIfNotPresent, nil
+		case string(corev1.PullNever):
+			return corev1.PullNever, nil
+		default:
+			return "", fmt.Errorf("Invalid IMAGE_PULL_POLICY environment variable value: %s", envVal)
+		}
+	}
+
+	// Default: PullIfNotPresent
+	return corev1.PullIfNotPresent, nil
+}
+
+// getRolloutsCommand will return the command for the Rollouts controller component.
+func getRolloutsCommandArgs(cr rolloutsmanagerv1alpha1.RolloutManager) ([]string, error) {
+	args := make([]string, 0)
+
+	if cr.Spec.NamespaceScoped {
+		args = append(args, "--namespaced")
+	}
+
+	if cr.Spec.HA != nil && cr.Spec.HA.Enabled {
+		args = append(args, "--leader-elect", "true")
+	}
+
+	extraArgs := cr.Spec.ExtraCommandArgs
+	err := isMergable(extraArgs, args)
+	if err != nil {
+		return args, err
+	}
+
+	args = append(args, extraArgs...)
+	return args, nil
+}
